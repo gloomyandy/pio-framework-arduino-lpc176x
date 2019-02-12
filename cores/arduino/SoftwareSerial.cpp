@@ -60,14 +60,17 @@ typedef struct _DELAY_TABLE {
 
 // rough delay estimation
 static const DELAY_TABLE table[] = {
-  //baud    |rxcenter|rxintra |rxstop  |tx { 250000,   2,      4,       4,       4,   }, //Done but not good due to instruction cycle error { 115200,   4,      8,       8,       8,   }, //Done but not good due to instruction cycle error
-  //{ 74880,   69,       139,       62,      162,  }, // estimation
-  //{ 57600,   100,       185,      1,       208,  }, // Done but not good due to instruction cycle error
-  //{ 38400,   13,      26,      26,      26,  }, // Done
-  //{ 19200,   26,      52,      52,      52,  }, // Done { 9600,    52,      104,     104,     104, }, // Done
-  //{ 4800,    104,     208,     208,     208, },
-  //{ 2400,    208,     417,     417,     417, },
-  //{ 1200,    416,    833,      833,     833,},
+  //baud    |rxcenter|rxintra |rxstop  |tx 
+  { 250000,   1050,      3900,       3900,       3900,   }, //Done but not good due to instruction cycle error 
+  { 115200,   4,      8,       8,       8,   }, //Done but not good due to instruction cycle error
+  { 74880,   6,       13,       13,      13,  }, // estimation
+  { 57600,   8,       17,      17,       17,  }, // Done but not good due to instruction cycle error
+  { 38400,   13,      26,      26,      26,  }, // Done
+  { 19200,   26,      52,      52,      52,  }, // Done 
+  { 9600,    52,      104,     104,     104, }, // Done
+  { 4800,    104,     208,     208,     208, },
+  { 2400,    208,     417,     417,     417, },
+  { 1200,    416,    833,      833,     833,},
 };
 
 //
@@ -75,7 +78,8 @@ static const DELAY_TABLE table[] = {
 //
 
 inline void SoftwareSerial::tunedDelay(const uint32_t count) {
-  time::delay_us(count);
+  //time::delay_us(count);
+  time::delay_ns(count);
 }
 
 // This function sets the current object as the "listening"
@@ -117,21 +121,28 @@ void SoftwareSerial::recv() {
 
   // If RX line is high, then we don't see any start bit
   // so interrupt is probably not for us
-  if (_inverse_logic ? rx_pin_read() : !rx_pin_read()) {
+  //if (_inverse_logic ? rx_pin_read() : !rx_pin_read()) {
+  if (_inverse_logic ? gpio_get(_receivePin) : !gpio_get(_receivePin)) {
     // Disable further interrupts during reception, this prevents
     // triggering another interrupt directly after we return, which can
     // cause problems at higher baudrates.
     setRxIntMsk(false);//__disable_irq();//
-
+gpio_set(_transmitPin, 0);
     // Wait approximately 1/2 of a bit width to "center" the sample
-    tunedDelay(_rx_delay_centering);
+    time::delay_ns(_rx_delay_centering);
+gpio_set(_transmitPin, 1);
     // Read each of the 8 bits
-    for (uint8_t i=8; i > 0; --i) {
-      tunedDelay(_rx_delay_intrabit);
+    for (uint8_t i=7; i > 0; --i) {
       d >>= 1;
-      if (rx_pin_read()) d |= 0x80;
+      if (gpio_get(_receivePin)) d |= 0x80;
+      time::delay_ns(_rx_delay_intrabit);
     }
-
+    d >>= 1;
+    if (gpio_get(_receivePin)) d |= 0x80;
+    time::delay_ns(1950);
+gpio_set(_transmitPin, 0);
+    // Re-enable interrupts when we're sure to be inside the stop bit
+    setRxIntMsk(true);  //__enable_irq();//
     if (_inverse_logic) d = ~d;
 
     // if buffer full, set the overflow flag and return
@@ -144,9 +155,7 @@ void SoftwareSerial::recv() {
     else {
       _buffer_overflow = true;
     }
-    tunedDelay(_rx_delay_stopbit);
-    // Re-enable interrupts when we're sure to be inside the stop bit
-    setRxIntMsk(true);  //__enable_irq();//
+gpio_set(_transmitPin, 1);
   }
 }
 
@@ -193,7 +202,8 @@ void SoftwareSerial::setTX(pin_t tx) {
   // output hihg. Now, it is input with pullup for a short while, which
   // is fine. With inverse logic, either order is fine.
 
-  digitalWrite(tx, _inverse_logic ? LOW : HIGH);
+  //digitalWrite(tx, _inverse_logic ? LOW : HIGH);
+  gpio_set(tx,_inverse_logic ? LOW : HIGH);
   pinMode(tx,OUTPUT);
   _transmitPin = tx;
 }
@@ -280,23 +290,26 @@ size_t SoftwareSerial::write(uint8_t b) {
   cli();  // turn off interrupts for a clean txmit
 
   // Write the start bit
-  digitalWrite(_transmitPin, !!inv);
+  //digitalWrite(_transmitPin, !!inv);
+  gpio_set(_transmitPin, !!inv);
 
-  tunedDelay(delay);
+  time::delay_ns(delay);
 
   // Write each of the 8 bits
   for (uint8_t i = 8; i > 0; --i) {
-    digitalWrite(_transmitPin, b & 1); // send 1 //(GPIO_Desc[_transmitPin].P)->DOUT |= GPIO_Desc[_transmitPin].bit;
+    gpio_set(_transmitPin, b & 1);
+    //digitalWrite(_transmitPin, b & 1); // send 1 //(GPIO_Desc[_transmitPin].P)->DOUT |= GPIO_Desc[_transmitPin].bit;
                                        // send 0 //(GPIO_Desc[_transmitPin].P)->DOUT &= ~GPIO_Desc[_transmitPin].bit;
-    tunedDelay(delay);
+    time::delay_ns(delay);
     b >>= 1;
   }
 
   // restore pin to natural state
-  digitalWrite(_transmitPin, !inv);
+  //digitalWrite(_transmitPin, !inv);
+  gpio_set(_transmitPin, !inv); 
 
   sei(); // turn interrupts back on
-  tunedDelay(delay);
+  time::delay_ns(delay);
 
   return 1;
 }
