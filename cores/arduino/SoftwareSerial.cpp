@@ -39,128 +39,148 @@
 #include <pinmapping.h>
 #include <time.h>
 #include "SoftwareSerial.h"
+#include "lpc17xx_rit.h"
+#include "lpc17xx_clkpwr.h"
+#include "debug_frmwrk.h"
 
-void GpioEnableInt(uint32_t port, uint32_t pin, uint32_t mode);
-void GpioDisableInt(uint32_t port, uint32_t pin);
+#define OVERSAMPLE 3
 //
 // Statics
 //
-SoftwareSerial *SoftwareSerial::active_object = 0;
-unsigned char SoftwareSerial::_receive_buffer[_SS_MAX_RX_BUFF];
-volatile uint8_t SoftwareSerial::_receive_buffer_tail = 0;
-volatile uint8_t SoftwareSerial::_receive_buffer_head = 0;
-
-typedef struct _DELAY_TABLE {
-  long baud;
-  uint16_t rx_delay_centering;
-  uint16_t rx_delay_intrabit;
-  uint16_t rx_delay_stopbit;
-  uint16_t tx_delay;
-} DELAY_TABLE;
-
-// rough delay estimation
-static const DELAY_TABLE table[] = {
-  //baud    |rxcenter|rxintra |rxstop  |tx 
-  { 250000,   1050,      3900,       3900,       3900,   }, //Done but not good due to instruction cycle error 
-  { 115200,   4,      8,       8,       8,   }, //Done but not good due to instruction cycle error
-  { 74880,   6,       13,       13,      13,  }, // estimation
-  { 57600,   8,       17,      17,       17,  }, // Done but not good due to instruction cycle error
-  { 38400,   13,      26,      26,      26,  }, // Done
-  { 19200,   26,      52,      52,      52,  }, // Done 
-  { 9600,    52,      104,     104,     104, }, // Done
-  { 4800,    104,     208,     208,     208, },
-  { 2400,    208,     417,     417,     417, },
-  { 1200,    416,    833,      833,     833,},
-};
+SoftwareSerial * volatile SoftwareSerial::active_out = NULL;
+SoftwareSerial * volatile SoftwareSerial:: active_in = NULL;
+int32_t SoftwareSerial::tx_tick_cnt = 0;
+int32_t SoftwareSerial::rx_tick_cnt = 0;
+uint32_t SoftwareSerial::tx_buffer = 0;
+uint32_t SoftwareSerial::rx_buffer = 0;
+int32_t SoftwareSerial::rx_bit_cnt = -1;
+uint32_t SoftwareSerial::cur_speed = 0;
 
 //
 // Private methods
 //
 
-inline void SoftwareSerial::tunedDelay(const uint32_t count) {
-  //time::delay_us(count);
-  time::delay_ns(count);
+void SoftwareSerial::setSpeed(uint32_t speed)
+{
+  if (speed != cur_speed) {
+    NVIC_DisableIRQ(RIT_IRQn);
+
+    if (speed != 0) {
+      uint32_t clock_rate, cmp_value;
+      // Get PCLK value of RIT
+      clock_rate = CLKPWR_GetPCLK(CLKPWR_PCLKSEL_RIT);
+      cmp_value = clock_rate/(speed*OVERSAMPLE);
+      LPC_RIT->RICOMPVAL = cmp_value;
+      LPC_RIT->RICOUNTER	= 0x00000000;
+      /* Set timer enable clear bit to clear timer to 0 whenever
+      * counter value equals the contents of RICOMPVAL
+      */
+      LPC_RIT->RICTRL |= (1<<1);
+      cur_speed = speed;
+      NVIC_EnableIRQ(RIT_IRQn);
+    }
+  }
 }
+
+
 
 // This function sets the current object as the "listening"
 // one and returns true if it replaces another
 bool SoftwareSerial::listen() {
-  if (!_rx_delay_stopbit)
-    return false;
-
-  if (active_object != this) {
-    if (active_object)
-      active_object->stopListening();
-
-    _buffer_overflow = false;
-    _receive_buffer_head = _receive_buffer_tail = 0;
-    active_object = this;
-
-    setRxIntMsk(true);
+  if (!_listening && _receivePin >= 0) {
+    // wait for any transmit to complete as we may change speed
+    while(active_out) ;
+    if (active_in) {
+      active_in->_listening = 0;
+      active_in = NULL;
+    }
+    _listening = 1;
+    rx_tick_cnt = 1;
+    rx_bit_cnt = -1;
+    setSpeed(_speed);
+    if (_half_duplex)
+      setRXTX(true);
+    else
+      active_in = this;
     return true;
   }
-
   return false;
 }
 
 // Stop listening. Returns true if we were actually listening.
 bool SoftwareSerial::stopListening() {
-  if (active_object == this) {
-    setRxIntMsk(false);
-    active_object = NULL;
+  if (_listening) {
+    // wait for any output to complete
+    while (active_out) ;
+    if (_half_duplex)
+      setRXTX(false);
+    active_in = NULL;
+    _listening = 0;
+    // turn off ints
+    setSpeed(0);
     return true;
   }
   return false;
+}
+
+void SoftwareSerial::send() {
+  if (--tx_tick_cnt <= 0) {
+    if (tx_buffer == 0) {
+      tx_tick_cnt = 0;
+      if (_half_duplex && _listening && !_output_pending)
+        setRXTX(true);
+      active_out = NULL;
+    }
+    else {
+      gpio_set(_transmitPin, tx_buffer & 1);
+      tx_buffer >>= 1;
+      tx_tick_cnt = OVERSAMPLE;
+    }
+  }
 }
 
 //
 // The receive routine called by the interrupt handler
 //
 void SoftwareSerial::recv() {
-  uint8_t d = 0;
-
-  // If RX line is high, then we don't see any start bit
-  // so interrupt is probably not for us
-  //if (_inverse_logic ? rx_pin_read() : !rx_pin_read()) {
-  if (_inverse_logic ? gpio_get(_receivePin) : !gpio_get(_receivePin)) {
-    // Disable further interrupts during reception, this prevents
-    // triggering another interrupt directly after we return, which can
-    // cause problems at higher baudrates.
-    setRxIntMsk(false);//__disable_irq();//
-gpio_set(_transmitPin, 0);
-    // Wait approximately 1/2 of a bit width to "center" the sample
-    time::delay_ns(_rx_delay_centering);
-gpio_set(_transmitPin, 1);
-    // Read each of the 8 bits
-    for (uint8_t i=7; i > 0; --i) {
-      d >>= 1;
-      if (gpio_get(_receivePin)) d |= 0x80;
-      time::delay_ns(_rx_delay_intrabit);
+  if (--rx_tick_cnt <= 0) {
+    uint8_t inbit = gpio_get(_receivePin);
+    if (rx_bit_cnt == -1) {
+      // waiting for start bit
+      if (!inbit) {
+        // got start bit
+        rx_bit_cnt = 0;
+        rx_tick_cnt = OVERSAMPLE+1;
+        rx_buffer = 0;
+      }
+      else
+        rx_tick_cnt = 1;
     }
-    d >>= 1;
-    if (gpio_get(_receivePin)) d |= 0x80;
-    time::delay_ns(1950);
-gpio_set(_transmitPin, 0);
-    // Re-enable interrupts when we're sure to be inside the stop bit
-    setRxIntMsk(true);  //__enable_irq();//
-    if (_inverse_logic) d = ~d;
-
-    // if buffer full, set the overflow flag and return
-    uint8_t next = (_receive_buffer_tail + 1) % _SS_MAX_RX_BUFF;
-    if (next != _receive_buffer_head) {
-      // save new data in buffer: tail points to where byte goes
-      _receive_buffer[_receive_buffer_tail] = d; // save new byte
-      _receive_buffer_tail = next;
+    else if (rx_bit_cnt >= 8) {
+      if (inbit) {
+        // stop bit read complete add to buffer
+        uint8_t next = (_receive_buffer_tail + 1) % _SS_MAX_RX_BUFF;
+        if (next != _receive_buffer_head) {
+          // save new data in buffer: tail points to where byte goes
+          _receive_buffer[_receive_buffer_tail] = rx_buffer; // save new byte
+          _receive_buffer_tail = next;
+        }
+        else {
+          _buffer_overflow = true;
+        }
+      }
+      rx_tick_cnt = 1;
+      rx_bit_cnt = -1;
     }
     else {
-      _buffer_overflow = true;
+      // data bits
+      rx_buffer >>= 1;
+      if (inbit)
+        rx_buffer |= 0x80;
+      rx_bit_cnt++;
+      rx_tick_cnt = OVERSAMPLE;
     }
-gpio_set(_transmitPin, 1);
   }
-}
-
-uint32_t SoftwareSerial::rx_pin_read() {
-  return digitalRead(_receivePin);
 }
 
 //
@@ -169,24 +189,28 @@ uint32_t SoftwareSerial::rx_pin_read() {
 
 /* static */
 inline void SoftwareSerial::handle_interrupt() {
-  if (active_object)
-    active_object->recv();
+  if (active_out) active_out->send();
+  if (active_in) active_in->recv();
 }
-extern "C" void intWrapper() {
+
+extern "C" void RIT_IRQHandler(void) {
+  LPC_RIT->RICTRL |= 1;
   SoftwareSerial::handle_interrupt();
 }
 //
 // Constructor
 //
 SoftwareSerial::SoftwareSerial(pin_t receivePin, pin_t transmitPin, bool inverse_logic /* = false */) :
-  _rx_delay_centering(0),
-  _rx_delay_intrabit(0),
-  _rx_delay_stopbit(0),
-  _tx_delay(0),
+  _receivePin(receivePin),
+  _transmitPin(transmitPin),
+  _speed(0),
   _buffer_overflow(false),
-  _inverse_logic(inverse_logic) {
-  setTX(transmitPin);
-  setRX(receivePin);
+  _inverse_logic(inverse_logic),
+  _listening(0),
+  _half_duplex(receivePin == transmitPin),
+  _output_pending(0),
+  _receive_buffer_tail(0),
+  _receive_buffer_head(0) {
 }
 
 //
@@ -196,28 +220,41 @@ SoftwareSerial::~SoftwareSerial() {
   end();
 }
 
-void SoftwareSerial::setTX(pin_t tx) {
+void SoftwareSerial::setTX() {
   // First write, then set output. If we do this the other way around,
   // the pin would be output low for a short while before switching to
   // output hihg. Now, it is input with pullup for a short while, which
   // is fine. With inverse logic, either order is fine.
 
-  //digitalWrite(tx, _inverse_logic ? LOW : HIGH);
-  gpio_set(tx,_inverse_logic ? LOW : HIGH);
-  pinMode(tx,OUTPUT);
-  _transmitPin = tx;
+  gpio_set(_transmitPin, _inverse_logic ? LOW : HIGH);
+  pinMode(_transmitPin, OUTPUT);
 }
 
-void SoftwareSerial::setRX(pin_t rx) {
-  pinMode(rx, INPUT_PULLUP); // pullup for normal logic!
-  //if (!_inverse_logic)
-  // digitalWrite(rx, HIGH);
-  _receivePin = rx;
-  _receivePort = LPC1768_PIN_PORT(rx);
-  _receivePortPin = LPC1768_PIN_PIN(rx);
-  /* GPIO_T * rxPort = digitalPinToPort(rx);
-  _receivePortRegister = portInputRegister(rxPort);
-  _receiveBitMask = digitalPinToBitMask(rx);*/
+void SoftwareSerial::setRX() {
+  if (_receivePin > 0) {
+    pinMode(_receivePin, _inverse_logic ? INPUT_PULLDOWN : INPUT_PULLUP); // pullup for normal logic!
+  }
+}
+
+void SoftwareSerial::setRXTX(bool input) {
+  //printf("rxtx\n");
+  if (_half_duplex) {
+    if (input) {
+      if (_listening && active_in == NULL) {
+        setRX();
+        rx_bit_cnt = -1;
+        rx_tick_cnt = 2;
+        active_in = this;
+      }
+    }
+    else {
+      if (active_in == this) {
+        setTX();
+        active_in = NULL;
+        tx_tick_cnt = 100;
+      }
+    }
+  }
 }
 
 //
@@ -225,31 +262,23 @@ void SoftwareSerial::setRX(pin_t rx) {
 //
 
 void SoftwareSerial::begin(long speed) {
-  _rx_delay_centering = _rx_delay_intrabit = _rx_delay_stopbit = _tx_delay = 0;
-
-  for(uint8_t i = 0; i < sizeof(table)/sizeof(table[0]); ++i) {
-    long baud = table[i].baud;
-    if (baud == speed) {
-      _rx_delay_centering = table[i].rx_delay_centering;
-      _rx_delay_intrabit = table[i].rx_delay_intrabit;
-      _rx_delay_stopbit = table[i].rx_delay_stopbit;
-      _tx_delay = table[i].tx_delay;
-      break;
-    }
+  speed = 9600;
+  _speed = speed;
+  RIT_Init(LPC_RIT);
+  NVIC_SetPriority(RIT_IRQn, NVIC_EncodePriority(0, 1, 0));
+  if (!_half_duplex) {
+    setTX();
+    setRX();
   }
-
-  attachInterrupt(_receivePin, intWrapper, CHANGE); //this->handle_interrupt, CHANGE);
-
   listen();
-  tunedDelay(_tx_delay);
-
-}
-
-void SoftwareSerial::setRxIntMsk(bool enable) {
-  if (enable)
-    GpioEnableInt(_receivePort,_receivePin,CHANGE);
-  else
-    GpioDisableInt(_receivePort,_receivePin);
+  _DBG("Speed ");
+  _DBD32(_speed);
+  _DBG(" rx ");
+  _DBD32(_receivePin);
+  _DBG(" tx ");
+  _DBD32(_transmitPin);
+  _DBG("\n");
+  //printf("hd %d active_in %d tx %d rx %d\n", _half_duplex, active_in, _receivePin, _transmitPin);
 }
 
 void SoftwareSerial::end() {
@@ -259,7 +288,7 @@ void SoftwareSerial::end() {
 
 // Read data from buffer
 int16_t SoftwareSerial::read() {
-  if (!isListening()) return -1;
+  //printf("hd %d active_in %d tx %d rx %d\n", _half_duplex, active_in, _receivePin, _transmitPin);
 
   // Empty buffer?
   if (_receive_buffer_head == _receive_buffer_tail) return -1;
@@ -267,65 +296,39 @@ int16_t SoftwareSerial::read() {
   // Read from "head"
   uint8_t d = _receive_buffer[_receive_buffer_head]; // grab next byte
   _receive_buffer_head = (_receive_buffer_head + 1) % _SS_MAX_RX_BUFF;
+  _DBG("Read "); _DBD32(d); _DBG("\n");
   return d;
 }
 
 size_t SoftwareSerial::available() {
-  if (!isListening()) return 0;
-
   return (_receive_buffer_tail + _SS_MAX_RX_BUFF - _receive_buffer_head) % _SS_MAX_RX_BUFF;
 }
 
 size_t SoftwareSerial::write(uint8_t b) {
-  // By declaring these as local variables, the compiler will put them
-  // in registers _before_ disabling interrupts and entering the
-  // critical timing sections below, which makes it a lot easier to
-  // verify the cycle timings
-
-  bool inv = _inverse_logic;
-  uint16_t delay = _tx_delay;
-
-  if (inv) b = ~b;
-
-  cli();  // turn off interrupts for a clean txmit
-
-  // Write the start bit
-  //digitalWrite(_transmitPin, !!inv);
-  gpio_set(_transmitPin, !!inv);
-
-  time::delay_ns(delay);
-
-  // Write each of the 8 bits
-  for (uint8_t i = 8; i > 0; --i) {
-    gpio_set(_transmitPin, b & 1);
-    //digitalWrite(_transmitPin, b & 1); // send 1 //(GPIO_Desc[_transmitPin].P)->DOUT |= GPIO_Desc[_transmitPin].bit;
-                                       // send 0 //(GPIO_Desc[_transmitPin].P)->DOUT &= ~GPIO_Desc[_transmitPin].bit;
-    time::delay_ns(delay);
-    b >>= 1;
-  }
-
-  // restore pin to natural state
-  //digitalWrite(_transmitPin, !inv);
-  gpio_set(_transmitPin, !inv); 
-
-  sei(); // turn interrupts back on
-  time::delay_ns(delay);
-
+  _DBG("Send "); _DBD32(b); _DBG("\n");
+  // wait for previous transmit to complete
+  _output_pending = 1;
+  while(active_out) ;
+  // add start and stop bits. Note we include an extra dummy stop bit to ensure correct timing
+  //tx_buffer = b << 1 | 0x200;
+  tx_buffer = b << 1 | 0x1e00;
+  tx_tick_cnt = 1;
+  setSpeed(_speed);
+  if (_half_duplex)
+    setRXTX(false);
+  _output_pending = 0;
+  // make us active
+  active_out = this;
   return 1;
 }
 
 void SoftwareSerial::flush() {
-  if (!isListening()) return;
-
   cli();
   _receive_buffer_head = _receive_buffer_tail = 0;
   sei();
 }
 
 int16_t SoftwareSerial::peek() {
-  if (!isListening())
-    return -1;
-
   // Empty buffer?
   if (_receive_buffer_head == _receive_buffer_tail)
     return -1;
