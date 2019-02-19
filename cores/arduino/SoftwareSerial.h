@@ -68,6 +68,7 @@ private:
   static int32_t tx_tick_cnt;
   static int32_t rx_tick_cnt;
   static uint32_t tx_buffer;
+  static int32_t tx_bit_cnt;
   static uint32_t rx_buffer;
   static int32_t rx_bit_cnt;
   static uint32_t cur_speed;

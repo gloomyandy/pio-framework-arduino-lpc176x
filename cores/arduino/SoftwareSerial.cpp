@@ -52,6 +52,7 @@ SoftwareSerial * volatile SoftwareSerial:: active_in = NULL;
 int32_t SoftwareSerial::tx_tick_cnt = 0;
 int32_t SoftwareSerial::rx_tick_cnt = 0;
 uint32_t SoftwareSerial::tx_buffer = 0;
+int32_t SoftwareSerial::tx_bit_cnt = 0;
 uint32_t SoftwareSerial::rx_buffer = 0;
 int32_t SoftwareSerial::rx_bit_cnt = -1;
 uint32_t SoftwareSerial::cur_speed = 0;
@@ -125,16 +126,22 @@ bool SoftwareSerial::stopListening() {
 
 void SoftwareSerial::send() {
   if (--tx_tick_cnt <= 0) {
-    if (tx_buffer == 0) {
-      tx_tick_cnt = 0;
-      if (_half_duplex && _listening && !_output_pending)
-        setRXTX(true);
-      active_out = NULL;
-    }
-    else {
+    if (tx_bit_cnt++ < 10 ) {
+      // send data (including start and stop bits)
       gpio_set(_transmitPin, tx_buffer & 1);
       tx_buffer >>= 1;
       tx_tick_cnt = OVERSAMPLE;
+    }
+    else {
+      tx_tick_cnt = 1;
+      if (_output_pending)
+        active_out = NULL;
+      else if (tx_bit_cnt > 10 + OVERSAMPLE*5)
+      {
+        if (_half_duplex && _listening)
+          setRXTX(true);
+        active_out = NULL;
+      }
     }
   }
 }
@@ -251,7 +258,6 @@ void SoftwareSerial::setRXTX(bool input) {
       if (active_in == this) {
         setTX();
         active_in = NULL;
-        tx_tick_cnt = 100;
       }
     }
   }
@@ -262,7 +268,7 @@ void SoftwareSerial::setRXTX(bool input) {
 //
 
 void SoftwareSerial::begin(long speed) {
-  speed = 9600;
+  speed = 38400;
   _speed = speed;
   RIT_Init(LPC_RIT);
   NVIC_SetPriority(RIT_IRQn, NVIC_EncodePriority(0, 1, 0));
@@ -296,7 +302,7 @@ int16_t SoftwareSerial::read() {
   // Read from "head"
   uint8_t d = _receive_buffer[_receive_buffer_head]; // grab next byte
   _receive_buffer_head = (_receive_buffer_head + 1) % _SS_MAX_RX_BUFF;
-  _DBG("Read "); _DBD32(d); _DBG("\n");
+  //_DBG("Read "); _DBD32(d); _DBG("\n");
   return d;
 }
 
@@ -305,14 +311,14 @@ size_t SoftwareSerial::available() {
 }
 
 size_t SoftwareSerial::write(uint8_t b) {
-  _DBG("Send "); _DBD32(b); _DBG("\n");
+  //_DBG("Send "); _DBD32(b); _DBG("\n");
   // wait for previous transmit to complete
   _output_pending = 1;
   while(active_out) ;
-  // add start and stop bits. Note we include an extra dummy stop bit to ensure correct timing
-  //tx_buffer = b << 1 | 0x200;
-  tx_buffer = b << 1 | 0x1e00;
-  tx_tick_cnt = 1;
+  // add start and stop bits.
+  tx_buffer = b << 1 | 0x200;
+  tx_bit_cnt = 0;
+  tx_tick_cnt = OVERSAMPLE;
   setSpeed(_speed);
   if (_half_duplex)
     setRXTX(false);
