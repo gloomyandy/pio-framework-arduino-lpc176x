@@ -62,6 +62,8 @@ private:
   volatile uint8_t _receive_buffer_tail;
   volatile uint8_t _receive_buffer_head;
 
+  uint32_t delta_start;
+
   // static data
   static SoftwareSerial * volatile active_out;
   static SoftwareSerial * volatile active_in;
@@ -96,6 +98,7 @@ public:
 
   virtual size_t write(uint8_t byte);
   virtual int16_t read();
+  virtual void poll(uint32_t ms);
   virtual size_t available();
   virtual void flush();
   operator bool() { return true; }
