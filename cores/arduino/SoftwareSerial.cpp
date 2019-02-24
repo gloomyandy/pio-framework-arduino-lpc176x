@@ -43,13 +43,14 @@
 #include "lpc17xx_clkpwr.h"
 #include "debug_frmwrk.h"
 
-#define USE_INTERRUPTS
-#ifdef USE_INTERRUPTS
+#define FORCE_BAUD_RATE 19200
+#define INTERRUPT_PRIORITY 0
 #define OVERSAMPLE 3
 //
 // Statics
 //
-static bool initialised = false;
+bool SoftwareSerial::initialised = false;
+SoftwareSerial * SoftwareSerial::active_listener = NULL;
 SoftwareSerial * volatile SoftwareSerial::active_out = NULL;
 SoftwareSerial * volatile SoftwareSerial:: active_in = NULL;
 int32_t SoftwareSerial::tx_tick_cnt = 0;
@@ -90,21 +91,17 @@ void SoftwareSerial::setSpeed(uint32_t speed)
 // This function sets the current object as the "listening"
 // one and returns true if it replaces another
 bool SoftwareSerial::listen() {
-  if (!_listening && _receivePin >= 0) {
+  if (_receivePin >= 0) {
     // wait for any transmit to complete as we may change speed
     while(active_out) ;
-    if (active_in) {
-      active_in->_listening = 0;
-      //active_in->stopListening();
-      active_in = NULL;
+    if (active_listener) {
+      active_listener->stopListening();
     }
-    _listening = 1;
     rx_tick_cnt = 1;
     rx_bit_cnt = -1;
     setSpeed(_speed);
-    if (_half_duplex)
-      setRXTX(true);
-    else
+    active_listener = this;
+    if (!_half_duplex)
       active_in = this;
     return true;
   }
@@ -113,13 +110,13 @@ bool SoftwareSerial::listen() {
 
 // Stop listening. Returns true if we were actually listening.
 bool SoftwareSerial::stopListening() {
-  if (_listening) {
+  if (active_listener == this) {
     // wait for any output to complete
     while (active_out) ;
     if (_half_duplex)
       setRXTX(false);
+    active_listener = NULL;
     active_in = NULL;
-    _listening = 0;
     // turn off ints
     setSpeed(0);
     return true;
@@ -127,7 +124,45 @@ bool SoftwareSerial::stopListening() {
   return false;
 }
 
-void SoftwareSerial::send() {
+
+inline void SoftwareSerial::setTX() {
+  // First write, then set output. If we do this the other way around,
+  // the pin would be output low for a short while before switching to
+  // output hihg. Now, it is input with pullup for a short while, which
+  // is fine. With inverse logic, either order is fine.
+
+  gpio_set(_transmitPin, _inverse_logic ? LOW : HIGH);
+  pinMode(_transmitPin, OUTPUT);
+}
+
+inline void SoftwareSerial::setRX() {
+  if (_receivePin > 0) {
+    pinMode(_receivePin, _inverse_logic ? INPUT_PULLDOWN : INPUT_PULLUP); // pullup for normal logic!
+  }
+}
+
+inline void SoftwareSerial::setRXTX(bool input) {
+  //printf("rxtx\n");
+  if (_half_duplex) {
+    if (input) {
+      if (active_in != this) {
+        setRX();
+        rx_bit_cnt = -1;
+        rx_tick_cnt = 2;
+        active_in = this;
+      }
+    }
+    else {
+      if (active_in == this) {
+        setTX();
+        active_in = NULL;
+      }
+    }
+  }
+}
+
+
+inline void SoftwareSerial::send() {
   if (--tx_tick_cnt <= 0) {
     if (tx_bit_cnt++ < 10 ) {
       // send data (including start and stop bits)
@@ -141,8 +176,13 @@ void SoftwareSerial::send() {
         active_out = NULL;
       else if (tx_bit_cnt > 10 + OVERSAMPLE*5)
       {
-        if (_half_duplex && _listening)
-          setRXTX(true);
+        if (_half_duplex && active_listener == this) {
+          // setRXTX(true);
+          pinMode(_receivePin, _inverse_logic ? INPUT_PULLDOWN : INPUT_PULLUP); // pullup for normal logic!
+          rx_bit_cnt = -1;
+          rx_tick_cnt = 2;
+          active_in = this;
+        }
         active_out = NULL;
       }
     }
@@ -152,7 +192,8 @@ void SoftwareSerial::send() {
 //
 // The receive routine called by the interrupt handler
 //
-void SoftwareSerial::recv() {
+inline void SoftwareSerial::recv() {
+  //gpio_set(P0_03, HIGH);
   if (--rx_tick_cnt <= 0) {
     uint8_t inbit = gpio_get(_receivePin);
     if (rx_bit_cnt == -1) {
@@ -191,6 +232,7 @@ void SoftwareSerial::recv() {
       rx_tick_cnt = OVERSAMPLE;
     }
   }
+  //gpio_set(P0_03, LOW);
 }
 
 //
@@ -199,14 +241,20 @@ void SoftwareSerial::recv() {
 
 /* static */
 inline void SoftwareSerial::handle_interrupt() {
-  if (active_out) active_out->send();
+  //gpio_set(P0_03, HIGH);
   if (active_in) active_in->recv();
+  //gpio_set(P0_03, HIGH);
+  if (active_out) active_out->send();
+  //gpio_set(P0_03, LOW);
 }
 
 extern "C" void RIT_IRQHandler(void) {
+  //gpio_set(P0_03, HIGH);
   LPC_RIT->RICTRL |= 1;
   SoftwareSerial::handle_interrupt();
+  //gpio_set(P0_03, LOW);
 }
+
 //
 // Constructor
 //
@@ -216,7 +264,6 @@ SoftwareSerial::SoftwareSerial(pin_t receivePin, pin_t transmitPin, bool inverse
   _speed(0),
   _buffer_overflow(false),
   _inverse_logic(inverse_logic),
-  _listening(0),
   _half_duplex(receivePin == transmitPin),
   _output_pending(0),
   _receive_buffer_tail(0),
@@ -230,60 +277,29 @@ SoftwareSerial::~SoftwareSerial() {
   end();
 }
 
-void SoftwareSerial::setTX() {
-  // First write, then set output. If we do this the other way around,
-  // the pin would be output low for a short while before switching to
-  // output hihg. Now, it is input with pullup for a short while, which
-  // is fine. With inverse logic, either order is fine.
-
-  gpio_set(_transmitPin, _inverse_logic ? LOW : HIGH);
-  pinMode(_transmitPin, OUTPUT);
-}
-
-void SoftwareSerial::setRX() {
-  if (_receivePin > 0) {
-    pinMode(_receivePin, _inverse_logic ? INPUT_PULLDOWN : INPUT_PULLUP); // pullup for normal logic!
-  }
-}
-
-void SoftwareSerial::setRXTX(bool input) {
-  //printf("rxtx\n");
-  if (_half_duplex) {
-    if (input) {
-      if (_listening && active_in == NULL) {
-        setRX();
-        rx_bit_cnt = -1;
-        rx_tick_cnt = 2;
-        active_in = this;
-      }
-    }
-    else {
-      if (active_in == this) {
-        //setTX();
-        active_in = NULL;
-      }
-      setTX();
-    }
-  }
-}
 
 //
 // Public methods
 //
 
 void SoftwareSerial::begin(long speed) {
-  //speed = 38400;
-  speed = 9600;
+  #ifdef FORCE_BAUD_RATE
+    speed = FORCE_BAUD_RATE;
+  #endif
   _speed = speed;
   if (!initialised) {
     RIT_Init(LPC_RIT);
-    NVIC_SetPriority(RIT_IRQn, NVIC_EncodePriority(0, 3, 0));
+    NVIC_SetPriority(RIT_IRQn, NVIC_EncodePriority(0, INTERRUPT_PRIORITY, 0));
     initialised = true;
+  pinMode(P0_03, OUTPUT);
   }
   if (!_half_duplex) {
     setTX();
     setRX();
   }
+  else
+    setTX();  
+  
   listen();
   _DBG("Speed ");
   _DBD32(_speed);
@@ -336,12 +352,6 @@ size_t SoftwareSerial::write(uint8_t b) {
   return 1;
 }
 
-void SoftwareSerial::poll(uint32_t ms)
-{
-  ms=10;
-  time::delay_ms(ms);
-}
-
 void SoftwareSerial::flush() {
   cli();
   _receive_buffer_head = _receive_buffer_tail = 0;
@@ -356,267 +366,3 @@ int16_t SoftwareSerial::peek() {
   // Read from "head"
   return _receive_buffer[_receive_buffer_head];
 }
-
-#else
-
-#define OVERSAMPLE 3
-uint32_t clock_rate;
-//
-// Statics
-//
-SoftwareSerial * volatile SoftwareSerial::active_out = NULL;
-SoftwareSerial * volatile SoftwareSerial:: active_in = NULL;
-int32_t SoftwareSerial::tx_tick_cnt = 0;
-int32_t SoftwareSerial::rx_tick_cnt = 0;
-uint32_t SoftwareSerial::tx_buffer = 0;
-int32_t SoftwareSerial::tx_bit_cnt = 0;
-uint32_t SoftwareSerial::rx_buffer = 0;
-int32_t SoftwareSerial::rx_bit_cnt = -1;
-uint32_t SoftwareSerial::cur_speed = 0;
-
-void ssdelay_us(uint32_t len)
-{
-  //time::delay_us(len);
-  
-  uint32_t ticks = (len*clock_rate)/1000000;
-  uint32_t start = LPC_RIT->RICOUNTER;
-  while((LPC_RIT->RICOUNTER - start) < ticks) ;
-}
-
-//
-// Private methods
-//
-void SoftwareSerial::setSpeed(uint32_t speed)
-{
-  if (speed != cur_speed) {
-    if (speed != 0) {
-      cur_speed = speed;
-      tx_tick_cnt = 1000000/speed;
-      rx_tick_cnt = 1000000/speed;
-    }
-  }
-}
-
-
-// This function sets the current object as the "listening"
-// one and returns true if it replaces another
-bool SoftwareSerial::listen() {
-  _listening = 1;
-  return false;
-}
-
-// Stop listening. Returns true if we were actually listening.
-bool SoftwareSerial::stopListening() {
-  if (_listening) {
-    _listening = 0;
-    return true;
-  }
-  return false;
-}
-
-void SoftwareSerial::send() {
-  //time::delay_us(tx_tick_cnt);
-  ssdelay_us(tx_tick_cnt);
-  tx_bit_cnt = 0;
-  //cli();
-  while (tx_bit_cnt++ < 10) {
-    // send data (including start and stop bits)
-    gpio_set(_transmitPin, tx_buffer & 1);
-    tx_buffer >>= 1;
-    //time::delay_us(tx_tick_cnt);
-    ssdelay_us(tx_tick_cnt);
-  }
-  //sei();
-}
-
-//
-// The receive routine called by the interrupt handler
-//
-void SoftwareSerial::recv() {
-  uint8_t inbit = gpio_get(_receivePin);
-  // waiting for start bit
-  if (!inbit) {
-    // got start bit
-    //cli();
-    //time::delay_us(3*rx_tick_cnt/2);
-    ssdelay_us(3*rx_tick_cnt/2);
-    rx_bit_cnt = 0;
-    while (rx_bit_cnt++ < 8) {
-      inbit = gpio_get(_receivePin);
-      rx_buffer >>= 1;
-      if (inbit)
-        rx_buffer |= 0x80;
-      //time::delay_us(rx_tick_cnt);
-      ssdelay_us(rx_tick_cnt);
-    }
-    // check stop bit is valid
-    inbit = gpio_get(_receivePin);
-    if (inbit) {
-      // stop bit read complete add to buffer
-      uint8_t next = (_receive_buffer_tail + 1) % _SS_MAX_RX_BUFF;
-      if (next != _receive_buffer_head) {
-        // save new data in buffer: tail points to where byte goes
-        _receive_buffer[_receive_buffer_tail] = rx_buffer; // save new byte
-        _receive_buffer_tail = next;
-      }
-      else {
-        _buffer_overflow = true;
-      }
-    }
-    //sei();
-  }
-}
-
-//
-// Interrupt handling
-//
-
-/* static */
-inline void SoftwareSerial::handle_interrupt() {
-}
-
-extern "C" void RIT_IRQHandler(void) {
-}
-//
-// Constructor
-//
-SoftwareSerial::SoftwareSerial(pin_t receivePin, pin_t transmitPin, bool inverse_logic /* = false */) :
-  _receivePin(receivePin),
-  _transmitPin(transmitPin),
-  _speed(0),
-  _buffer_overflow(false),
-  _inverse_logic(inverse_logic),
-  _listening(0),
-  _half_duplex(receivePin == transmitPin),
-  _output_pending(0),
-  _receive_buffer_tail(0),
-  _receive_buffer_head(0) {
-}
-
-//
-// Destructor
-//
-SoftwareSerial::~SoftwareSerial() {
-  end();
-}
-
-void SoftwareSerial::setTX() {
-  // First write, then set output. If we do this the other way around,
-  // the pin would be output low for a short while before switching to
-  // output hihg. Now, it is input with pullup for a short while, which
-  // is fine. With inverse logic, either order is fine.
-
-  gpio_set(_transmitPin, _inverse_logic ? LOW : HIGH);
-  pinMode(_transmitPin, OUTPUT);
-}
-
-void SoftwareSerial::setRX() {
-  if (_receivePin > 0) {
-    pinMode(_receivePin, _inverse_logic ? INPUT_PULLDOWN : INPUT_PULLUP); // pullup for normal logic!
-  }
-}
-
-void SoftwareSerial::setRXTX(bool input) {
-  //printf("rxtx\n");
-  if (_half_duplex) {
-    if (input) {
-      if (_listening) {
-        setRX();
-      }
-    }
-    else {
-        setTX();
-    }
-  }
-}
-
-//
-// Public methods
-//
-
-void SoftwareSerial::begin(long speed) {
-  //speed = 38400;
-  speed = 9600;
-  _speed = speed;
-  RIT_Init(LPC_RIT);
-  clock_rate = CLKPWR_GetPCLK(CLKPWR_PCLKSEL_RIT);
-
-
-  if (!_half_duplex) {
-    setTX();
-    setRX();
-  }
-  listen();
-  _DBG("Speed ");
-  _DBD32(_speed);
-  _DBG(" rx ");
-  _DBD32(_receivePin);
-  _DBG(" tx ");
-  _DBD32(_transmitPin);
-  _DBG("\n");
-  //printf("hd %d active_in %d tx %d rx %d\n", _half_duplex, active_in, _receivePin, _transmitPin);
-}
-
-void SoftwareSerial::end() {
-  stopListening();
-}
-
-
-// Read data from buffer
-int16_t SoftwareSerial::read() {
-  //printf("hd %d active_in %d tx %d rx %d\n", _half_duplex, active_in, _receivePin, _transmitPin);
-
-  // Empty buffer?
-  if (_receive_buffer_head == _receive_buffer_tail) return -1;
-
-  // Read from "head"
-  uint8_t d = _receive_buffer[_receive_buffer_head]; // grab next byte
-  _receive_buffer_head = (_receive_buffer_head + 1) % _SS_MAX_RX_BUFF;
-  //_DBG("Read "); _DBD32(d); _DBG("\n");
-  return d;
-}
-
-size_t SoftwareSerial::available() {
-  return (_receive_buffer_tail + _SS_MAX_RX_BUFF - _receive_buffer_head) % _SS_MAX_RX_BUFF;
-}
-
-size_t SoftwareSerial::write(uint8_t b) {
-  //_DBG("Send "); _DBD32(b); _DBG("\n");
-  tx_buffer = b << 1 | 0x200;
-  setSpeed(_speed);
-  setRXTX(false);
-  send();
-  delta_start = millis();
-  return 1;
-}
-
-void SoftwareSerial::poll(uint32_t ms)
-{
-  //time::delay_us(4*rx_tick_cnt);
-  setSpeed(_speed);
-  setRXTX(true);
-  //time::delay_us(2*rx_tick_cnt);
-  ssdelay_us(2*rx_tick_cnt);
-  uint32_t start = millis();
-  ms=10;
-  while(millis() - start < ms)
-    recv();
-  //_DBG("D "); _DBH32(de-delta_start);
-  setRXTX(false);
-}
-
-void SoftwareSerial::flush() {
-  cli();
-  _receive_buffer_head = _receive_buffer_tail = 0;
-  sei();
-}
-
-int16_t SoftwareSerial::peek() {
-  // Empty buffer?
-  if (_receive_buffer_head == _receive_buffer_tail)
-    return -1;
-
-  // Read from "head"
-  return _receive_buffer[_receive_buffer_head];
-}
-#endif

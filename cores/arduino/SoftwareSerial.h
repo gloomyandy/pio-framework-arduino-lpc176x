@@ -54,7 +54,6 @@ private:
 
   uint16_t _buffer_overflow:1;
   uint16_t _inverse_logic:1;
-  uint16_t _listening:1;
   uint16_t _half_duplex:1;
   uint16_t _output_pending:1;
 
@@ -65,6 +64,8 @@ private:
   uint32_t delta_start;
 
   // static data
+  static bool initialised;
+  static SoftwareSerial * active_listener;
   static SoftwareSerial * volatile active_out;
   static SoftwareSerial * volatile active_in;
   static int32_t tx_tick_cnt;
@@ -91,14 +92,13 @@ public:
   void begin(long speed);
   bool listen();
   void end();
-  bool isListening() { return _listening; }
+  bool isListening() { return active_listener == this; }
   bool stopListening();
   bool overflow() { bool ret = _buffer_overflow; if (ret) _buffer_overflow = false; return ret; }
   int16_t peek();
 
   virtual size_t write(uint8_t byte);
   virtual int16_t read();
-  virtual void poll(uint32_t ms);
   virtual size_t available();
   virtual void flush();
   operator bool() { return true; }
